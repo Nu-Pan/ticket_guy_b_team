@@ -5,19 +5,26 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ticket-guy-b-team"
 version = "0.1.0"
-description = "Minimal bootstrap for ticket_guy_b_team"
+description = "CLI frontend for spec-review-driven multi-agent development"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []
+
+[project.scripts]
+ticketguy = "main:main"
 
 [project.optional-dependencies]
 dev = [
     "pyright>=1.1.397",
     "pytest>=8.3.5",
+    "pytest-cov>=6.0.0",
 ]
-
-[tool.setuptools]
-py-modules = ["main"]
 
 [tool.setuptools.package-dir]
 "" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools]
+py-modules = ["main", "typer"]
