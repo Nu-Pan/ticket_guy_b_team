@@ -2,9 +2,10 @@
 
 set -eu
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python"
-MAIN_SCRIPT="$SCRIPT_DIR/src/main.py"
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$BIN_DIR/.." && pwd)"
+PYTHON_BIN="$REPO_ROOT/.venv/bin/python"
+MAIN_SCRIPT="$REPO_ROOT/src/main.py"
 
 if [ ! -x "$PYTHON_BIN" ]; then
   echo "missing python executable: $PYTHON_BIN" >&2
