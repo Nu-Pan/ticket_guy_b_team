@@ -1,10 +1,12 @@
 """ticket_guy_b_team の CLI 本体。"""
 
 import json
+import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Mapping, Sequence, cast
+from typing import Any, Callable, Mapping, NotRequired, Sequence, TypedDict, cast
 
 import typer
 from langgraph.graph import END, StateGraph
@@ -46,6 +48,9 @@ TICKET_STATUSES = {"todo", "blocked", "running", "review_pending", "done", "fail
 REVIEW_RESULTS = {"pass", "fail"}
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 DEFAULT_PRIORITY = "high"
+RUN_MODES = {"dry-run", "production"}
+DEFAULT_PRODUCTION_MODEL = "gpt-5.4"
+DEFAULT_REASONING_EFFORT = "medium"
 APP = typer.Typer()
 review_app = typer.Typer()
 APP.add_typer(review_app, name="review")
@@ -65,6 +70,26 @@ class Document:
 
     metadata: dict[str, object]
     body: str
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    """実行モードとモデル設定を表す。"""
+
+    mode: str = "dry-run"
+    model: str = DEFAULT_PRODUCTION_MODEL
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT
+
+
+class RunState(TypedDict):
+    """LangGraph が流す実行状態。"""
+
+    ticket_id: str
+    document: NotRequired[Document]
+    dependencies: NotRequired[list[Dependency]]
+    dependencies_ok: NotRequired[bool]
+    missing_dependencies: NotRequired[list[Dependency]]
+    artifacts: NotRequired[list[str]]
 
 
 def utc_now() -> str:
@@ -246,6 +271,14 @@ def slug_from_title(raw_value: str) -> str:
     """タイトルから短い slug を作る。"""
     parts = [part for part in normalize_plan_id(raw_value).split("-") if part]
     return "-".join(parts[:4]) or "item"
+
+
+def request_from_plan(plan: Document) -> str:
+    """計画書本文から元の要望行を取り出す。"""
+    for line in plan.body.splitlines():
+        if line.startswith("要望: "):
+            return line.removeprefix("要望: ").strip()
+    return str(plan.metadata.get("title", ""))
 
 
 def build_plan_body(request_text: str) -> str:
@@ -563,13 +596,17 @@ def update_ticket_status(ticket_id: str, next_status: str, base_dir: Path | None
     write_ticket(ticket_id, document.metadata, document.body, base_dir)
 
 
-def create_run_graph(base_dir: Path | None = None) -> Callable[[dict[str, object]], dict[str, object]]:
-    """dry run 用のワークフローを構築する。"""
-    graph = StateGraph(dict)
-    graph.add_node("load", lambda state: node_load(state, base_dir))
-    graph.add_node("check", lambda state: node_check_dependencies(state, base_dir))
-    graph.add_node("execute", lambda state: node_execute(state, base_dir))
-    graph.add_node("finalize", lambda state: node_finalize(state, base_dir))
+def create_run_graph(
+    base_dir: Path | None = None,
+    run_config: RunConfig | None = None,
+) -> Callable[[RunState], RunState]:
+    """実行モードごとのワークフローを構築する。"""
+    config = run_config or RunConfig()
+    graph = StateGraph(RunState)
+    graph.add_node("load", cast(Any, lambda state: node_load(cast(RunState, state), base_dir)))
+    graph.add_node("check", cast(Any, lambda state: node_check_dependencies(cast(RunState, state), base_dir)))
+    graph.add_node("execute", cast(Any, lambda state: node_execute(cast(RunState, state), base_dir, config)))
+    graph.add_node("finalize", cast(Any, lambda state: node_finalize(cast(RunState, state), base_dir)))
     graph.set_entry_point("load")
     graph.add_edge("load", "check")
     graph.add_conditional_edges(
@@ -579,10 +616,10 @@ def create_run_graph(base_dir: Path | None = None) -> Callable[[dict[str, object
     )
     graph.add_edge("execute", "finalize")
     graph.add_edge("finalize", END)
-    return graph.compile().invoke
+    return cast(Callable[[RunState], RunState], graph.compile().invoke)
 
 
-def node_load(state: dict[str, object], base_dir: Path | None) -> dict[str, object]:
+def node_load(state: RunState, base_dir: Path | None) -> RunState:
     """チケット文書を読み込む。"""
     ticket_id = str(state["ticket_id"])
     document = load_ticket(ticket_id, base_dir)
@@ -594,77 +631,222 @@ def node_load(state: dict[str, object], base_dir: Path | None) -> dict[str, obje
     return state
 
 
-def node_check_dependencies(state: dict[str, object], base_dir: Path | None) -> dict[str, object]:
+def node_check_dependencies(state: RunState, base_dir: Path | None) -> RunState:
     """依存解決可否を確認する。"""
-    dependencies = cast(list[Dependency], state["dependencies"])
+    dependencies = cast(list[Dependency], state.get("dependencies", []))
     missing = [dependency for dependency in dependencies if not dependency_satisfied(dependency, base_dir)]
     state["dependencies_ok"] = not missing
     state["missing_dependencies"] = missing
     return state
 
 
-def node_execute(state: dict[str, object], base_dir: Path | None) -> dict[str, object]:
-    """チケット種別ごとの dry run を実行する。"""
-    document = cast(Document, state["document"])
+def node_execute(state: RunState, base_dir: Path | None, run_config: RunConfig) -> RunState:
+    """チケット種別ごとの処理を実行する。"""
+    document = cast(Document, state.get("document"))
     metadata = document.metadata
     ticket_id = str(metadata["ticket_id"])
     ticket_type = str(metadata["ticket_type"])
     metadata["status"] = "running"
     write_ticket(ticket_id, metadata, document.body, base_dir)
 
-    # 種別ごとの最小成果物を出力する。
+    # 種別とモードごとの最小処理を行う。
     if ticket_type == "worker":
-        log_path = write_log(ticket_id, "worker executed in dry run mode", base_dir)
-        metadata["status"] = "review_pending"
-        state["artifacts"] = [str(log_path.relative_to(runtime_root(base_dir)))]
+        result = execute_worker_ticket(ticket_id, metadata, base_dir, run_config)
     elif ticket_type == "review":
-        target_ticket_id = str(metadata.get("target_ticket_id", ""))
-        target_document = load_ticket(target_ticket_id, base_dir)
-        target_status = str(target_document.metadata.get("status"))
-        if target_status != "review_pending":
-            metadata["status"] = "blocked"
-            write_log(ticket_id, "review blocked because target is not review_pending", base_dir)
-            state["artifacts"] = []
-        else:
-            review_path = write_review_result(ticket_id, target_ticket_id, "pass", False, base_dir)
-            metadata["status"] = "done"
-            update_ticket_status(target_ticket_id, "done", base_dir)
-            state["artifacts"] = [str(review_path.relative_to(runtime_root(base_dir)))]
+        result = execute_review_ticket(ticket_id, metadata, base_dir, run_config)
     elif ticket_type == "integration":
-        target_ticket_id = str(metadata.get("target_ticket_id", ""))
-        review_path = write_review_result(ticket_id, target_ticket_id, "pass", False, base_dir)
-        metadata["status"] = "done"
-        state["artifacts"] = [str(review_path.relative_to(runtime_root(base_dir)))]
+        result = execute_integration_ticket(ticket_id, metadata, base_dir, run_config)
     elif ticket_type == "root":
-        children = metadata.get("children", [])
-        if not isinstance(children, list):
-            children = []
-        child_ids = [str(child) for child in children]
-        if child_ids and all(str(load_ticket(child, base_dir).metadata.get("status")) == "done" for child in child_ids):
-            metadata["status"] = "done"
-        else:
-            metadata["status"] = "running"
-        log_path = write_log(ticket_id, f"root evaluated children={json.dumps(child_ids)}", base_dir)
-        state["artifacts"] = [str(log_path.relative_to(runtime_root(base_dir)))]
+        result = execute_root_ticket(ticket_id, metadata, base_dir)
     else:
         metadata["status"] = "failed"
-        write_log(ticket_id, f"unknown ticket type: {ticket_type}", base_dir)
-        state["artifacts"] = []
+        log_path = write_log(ticket_id, f"unknown ticket type: {ticket_type}", base_dir)
+        result = [str(log_path.relative_to(runtime_root(base_dir)))]
 
+    state["artifacts"] = result
     write_ticket(ticket_id, metadata, document.body, base_dir)
     state["document"] = load_ticket(ticket_id, base_dir)
     return state
 
 
-def node_finalize(state: dict[str, object], base_dir: Path | None) -> dict[str, object]:
+def execute_worker_ticket(
+    ticket_id: str,
+    metadata: dict[str, object],
+    base_dir: Path | None,
+    run_config: RunConfig,
+) -> list[str]:
+    """worker ticket を実行する。"""
+    if run_config.mode == "dry-run":
+        log_path = write_log(ticket_id, "worker executed in dry run mode", base_dir)
+        metadata["status"] = "review_pending"
+        return [str(log_path.relative_to(runtime_root(base_dir)))]
+
+    completed = run_codex_for_ticket(ticket_id, metadata, base_dir, run_config)
+    if completed.returncode == 0:
+        metadata["status"] = "review_pending"
+    else:
+        metadata["status"] = "failed"
+    return [f"artifacts/logs/{ticket_id}.log"]
+
+
+def execute_review_ticket(
+    ticket_id: str,
+    metadata: dict[str, object],
+    base_dir: Path | None,
+    run_config: RunConfig,
+) -> list[str]:
+    """review ticket を実行する。"""
+    target_ticket_id = str(metadata.get("target_ticket_id", ""))
+    target_document = load_ticket(target_ticket_id, base_dir)
+    target_status = str(target_document.metadata.get("status"))
+    if target_status != "review_pending":
+        metadata["status"] = "blocked"
+        write_log(ticket_id, "review blocked because target is not review_pending", base_dir)
+        return []
+
+    if run_config.mode == "dry-run":
+        review_path = write_review_result(ticket_id, target_ticket_id, "pass", False, base_dir)
+        metadata["status"] = "done"
+        update_ticket_status(target_ticket_id, "done", base_dir)
+        return [str(review_path.relative_to(runtime_root(base_dir)))]
+
+    passed, details = run_acceptance_gate(ticket_id, base_dir)
+    write_log(ticket_id, details, base_dir)
+    review_path = write_review_result(ticket_id, target_ticket_id, "pass" if passed else "fail", not passed, base_dir)
+    metadata["status"] = "done" if passed else "failed"
+    update_ticket_status(target_ticket_id, "done" if passed else "failed", base_dir)
+    return [str(review_path.relative_to(runtime_root(base_dir))), f"artifacts/logs/{ticket_id}.log"]
+
+
+def execute_integration_ticket(
+    ticket_id: str,
+    metadata: dict[str, object],
+    base_dir: Path | None,
+    run_config: RunConfig,
+) -> list[str]:
+    """integration ticket を実行する。"""
+    target_ticket_id = str(metadata.get("target_ticket_id", ""))
+    if run_config.mode == "dry-run":
+        review_path = write_review_result(ticket_id, target_ticket_id, "pass", False, base_dir)
+        metadata["status"] = "done"
+        return [str(review_path.relative_to(runtime_root(base_dir)))]
+
+    passed, details = run_acceptance_gate(ticket_id, base_dir)
+    write_log(ticket_id, details, base_dir)
+    review_path = write_review_result(ticket_id, target_ticket_id, "pass" if passed else "fail", not passed, base_dir)
+    metadata["status"] = "done" if passed else "failed"
+    return [str(review_path.relative_to(runtime_root(base_dir))), f"artifacts/logs/{ticket_id}.log"]
+
+
+def execute_root_ticket(ticket_id: str, metadata: dict[str, object], base_dir: Path | None) -> list[str]:
+    """root ticket を実行する。"""
+    children = metadata.get("children", [])
+    if not isinstance(children, list):
+        children = []
+    child_ids = [str(child) for child in children]
+    if child_ids and all(str(load_ticket(child, base_dir).metadata.get("status")) == "done" for child in child_ids):
+        metadata["status"] = "done"
+    else:
+        metadata["status"] = "running"
+    log_path = write_log(ticket_id, f"root evaluated children={json.dumps(child_ids)}", base_dir)
+    return [str(log_path.relative_to(runtime_root(base_dir)))]
+
+
+def build_codex_prompt(ticket_id: str, metadata: dict[str, object], base_dir: Path | None) -> str:
+    """worker ticket 向けの Codex プロンプトを組み立てる。"""
+    plan = load_plan(str(metadata["plan_id"]), base_dir)
+    request_text = request_from_plan(plan)
+    lines = [
+        "承認済み plan に従って、現在のリポジトリへ最小変更で実装してください。",
+        "日本語で考えてよいですが、コード・ログメッセージは既存規約に従ってください。",
+        "作業後に、実施した変更と実行した検証を簡潔に最終メッセージへ書いてください。",
+        f"ticket_id: {ticket_id}",
+        f"plan_id: {metadata['plan_id']}",
+        f"request: {request_text}",
+        "",
+        "plan body:",
+        plan.body,
+    ]
+    return "\n".join(lines)
+
+
+def run_codex_for_ticket(
+    ticket_id: str,
+    metadata: dict[str, object],
+    base_dir: Path | None,
+    run_config: RunConfig,
+) -> subprocess.CompletedProcess[str]:
+    """Codex CLI を呼び出して worker ticket を実行する。"""
+    log_path = artifacts_root(base_dir) / "logs" / f"{ticket_id}.log"
+    prompt = build_codex_prompt(ticket_id, metadata, base_dir)
+    command = [
+        "codex",
+        "exec",
+        "--model",
+        run_config.model,
+        "-c",
+        f'model_reasoning_effort="{run_config.reasoning_effort}"',
+        "--sandbox",
+        "workspace-write",
+        "--skip-git-repo-check",
+        "--cd",
+        str(runtime_root(base_dir)),
+        "--output-last-message",
+        str(log_path),
+        prompt,
+    ]
+    completed = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    # Codex の stdout/stderr も同じログに追記して、失敗調査を容易にする。
+    log_lines = [
+        "[stdout]",
+        completed.stdout.rstrip(),
+        "",
+        "[stderr]",
+        completed.stderr.rstrip(),
+    ]
+    write_log(ticket_id, "\n".join(log_lines), base_dir)
+    return completed
+
+
+def run_acceptance_gate(ticket_id: str, base_dir: Path | None) -> tuple[bool, str]:
+    """本番モードの review / integration 用受け入れゲートを実行する。"""
+    workdir = runtime_root(base_dir)
+    tests_dir = workdir / "tests"
+    if not tests_dir.exists():
+        return True, "no tests directory; existence check only"
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q"],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=workdir,
+    )
+    log_lines = [
+        f"acceptance gate for {ticket_id}",
+        "[stdout]",
+        completed.stdout.rstrip(),
+        "",
+        "[stderr]",
+        completed.stderr.rstrip(),
+    ]
+    return completed.returncode == 0, "\n".join(log_lines)
+
+
+def node_finalize(state: RunState, base_dir: Path | None) -> RunState:
     """依存未解決時や終了時の状態を確定する。"""
-    document = cast(Document, state["document"])
+    document = cast(Document, state.get("document"))
     metadata = document.metadata
-    if not bool(state["dependencies_ok"]):
+    if not bool(state.get("dependencies_ok", False)):
         metadata["status"] = "blocked"
         missing = [
             {"ticket_id": dependency.ticket_id, "required_state": dependency.required_state}
-            for dependency in cast(list[Dependency], state["missing_dependencies"])
+            for dependency in cast(list[Dependency], state.get("missing_dependencies", []))
         ]
         write_log(str(metadata["ticket_id"]), f"blocked: {json.dumps(missing)}", base_dir)
         write_ticket(str(metadata["ticket_id"]), metadata, document.body, base_dir)
@@ -672,11 +854,16 @@ def node_finalize(state: dict[str, object], base_dir: Path | None) -> dict[str, 
     return state
 
 
-def run_ticket(ticket_id: str, base_dir: Path | None = None) -> dict[str, object]:
-    """単一チケットの dry run を実行する。"""
+def run_ticket(
+    ticket_id: str,
+    base_dir: Path | None = None,
+    run_config: RunConfig | None = None,
+) -> dict[str, object]:
+    """単一チケットを実行する。"""
     ensure_artifact_dirs(base_dir)
-    state = create_run_graph(base_dir)({"ticket_id": ticket_id})
-    document = cast(Document, state["document"])
+    config = run_config or RunConfig()
+    state = create_run_graph(base_dir, config)({"ticket_id": ticket_id})
+    document = cast(Document, state.get("document"))
     metadata = document.metadata
     return {
         "ticket_id": metadata["ticket_id"],
@@ -690,14 +877,19 @@ def run_ticket(ticket_id: str, base_dir: Path | None = None) -> dict[str, object
     }
 
 
-def run_root_ticket(ticket_id: str, base_dir: Path | None = None) -> list[dict[str, object]]:
-    """root ticket 配下を依存順で逐次 dry run する。"""
+def run_root_ticket(
+    ticket_id: str,
+    base_dir: Path | None = None,
+    run_config: RunConfig | None = None,
+) -> list[dict[str, object]]:
+    """root ticket 配下を依存順で逐次実行する。"""
     root_document = load_ticket(ticket_id, base_dir)
     children = root_document.metadata.get("children", [])
     if not isinstance(children, list):
         children = []
     ordered_ids = [str(child) for child in children] + [ticket_id]
-    return [run_ticket(current_id, base_dir) for current_id in ordered_ids]
+    config = run_config or RunConfig()
+    return [run_ticket(current_id, base_dir, config) for current_id in ordered_ids]
 
 
 def collect_review_queue(base_dir: Path | None = None) -> list[dict[str, object]]:
@@ -779,13 +971,21 @@ def ticket(plan_id: str) -> None:
 
 
 @APP.command()
-def run(ticket_id: str) -> None:
-    """チケットまたは root ticket を dry run 実行する。"""
+def run(
+    ticket_id: str,
+    mode: str = "dry-run",
+    model: str = DEFAULT_PRODUCTION_MODEL,
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+) -> None:
+    """チケットまたは root ticket を実行する。"""
+    if mode not in RUN_MODES:
+        raise typer.Exit(1, f"invalid mode: {mode}")
+    run_config = RunConfig(mode=mode, model=model, reasoning_effort=reasoning_effort)
     document = load_ticket(ticket_id)
     if str(document.metadata.get("ticket_type")) == "root":
-        result = run_root_ticket(ticket_id)
+        result = run_root_ticket(ticket_id, run_config=run_config)
     else:
-        result = [run_ticket(ticket_id)]
+        result = [run_ticket(ticket_id, run_config=run_config)]
     typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
 
 

@@ -44,8 +44,10 @@ def _metadata_text() -> str:
         f"Name: {metadata['name']}",
         f"Version: {metadata['version']}",
         f"Summary: {metadata.get('description', '')}",
-        "",
     ]
+    for requirement in metadata.get("dependencies", []):
+        lines.append(f"Requires-Dist: {requirement}")
+    lines.append("")
     return "\n".join(lines)
 
 

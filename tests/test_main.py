@@ -4,6 +4,7 @@
 
 import io
 import json
+import subprocess
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -265,3 +266,78 @@ def test_internal_helpers_cover_error_paths(tmp_path: Path) -> None:
 
     with pytest.raises(main.typer.Exit):
         main.collect_artifacts("missing", tmp_path)
+
+
+def test_production_mode_runs_codex_then_pytest_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """production mode では Codex 実行と pytest ゲートを順に使う。"""
+    (tmp_path / "app.py").write_text(
+        'def hello() -> str:\n    """挨拶を返す。"""\n    return "ng"\n',
+        encoding="utf-8",
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_app.py").write_text(
+        'from app import hello\n\n\ndef test_hello() -> None:\n    assert hello() == "ok"\n',
+        encoding="utf-8",
+    )
+
+    plan_path = main.save_plan("app.py の hello を ok に修正する", base_dir=tmp_path)
+    prepare_approvable_plan(
+        plan_path,
+        {
+            "TODO: 未確定事項 を具体化する": "継続可能",
+            "TODO: 差し戻し条件 を具体化する": "pytest 失敗時は差し戻す",
+            "TODO: 検証戦略 を具体化する": "pytest -q を実行する",
+        },
+    )
+    main.update_plan_status(plan_path.stem, "in_review", tmp_path)
+    main.update_plan_status(plan_path.stem, "approved", tmp_path)
+    ticket_paths = main.build_ticket_set(plan_path.stem, tmp_path)
+    worker_id = next(path.stem for path in ticket_paths if "-worker-" in path.stem)
+    review_id = next(path.stem for path in ticket_paths if "-review-" in path.stem)
+    integration_id = next(path.stem for path in ticket_paths if "-integration-" in path.stem)
+    root_id = next(path.stem for path in ticket_paths if path.stem.endswith("-root"))
+
+    original_run = subprocess.run
+    codex_commands: list[list[str]] = []
+
+    def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        command = list(args[0])
+        if command and command[0] == "codex":
+            codex_commands.append(command)
+            (tmp_path / "app.py").write_text(
+                'def hello() -> str:\n    """挨拶を返す。"""\n    return "ok"\n',
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(command, 0, "codex stdout", "codex stderr")
+        return original_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    config = main.RunConfig(mode="production", model="gpt-5.1-codex-mini", reasoning_effort="low")
+    worker_result = main.run_ticket(worker_id, tmp_path, config)
+    assert worker_result["status"] == "review_pending"
+    assert codex_commands
+    assert codex_commands[0][0:3] == ["codex", "exec", "--model"]
+    assert "gpt-5.1-codex-mini" in codex_commands[0]
+
+    review_result = main.run_ticket(review_id, tmp_path, config)
+    assert review_result["status"] == "done"
+    assert main.load_ticket(worker_id, tmp_path).metadata["status"] == "done"
+
+    integration_result = main.run_ticket(integration_id, tmp_path, config)
+    assert integration_result["status"] == "done"
+    root_result = main.run_ticket(root_id, tmp_path, config)
+    assert root_result["status"] == "done"
+
+    completed = original_run(
+        [sys.executable, "-m", "pytest", "-q"],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr

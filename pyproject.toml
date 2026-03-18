@@ -9,7 +9,9 @@ version = "0.1.0"
 description = "CLI frontend for spec-review-driven multi-agent development"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "langgraph>=1.1.2",
+]
 
 [project.scripts]
 ticketguy = "main:main"
