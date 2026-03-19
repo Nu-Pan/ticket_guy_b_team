@@ -51,10 +51,20 @@
 - python 3.12.3
 - システムワイドの `python3` を直接使うのは禁止
 - python 仮想環境として `.venv` を使う
-    - `.venv/bin/python` を使う
-    - `.venv/bin/python -m pip` を使う
-- `pyporject.toml` を書いて、それを `.venv/bin/python -m pip install -e .` でインストールする
-- 必要なパッケージは `pyporject.toml` に書く
+    - python インタプリタは `.venv/bin/python` を使う
+    - pip パッケージマネージャは `.venv/bin/python -m pip` を使う
+- 仮想環境の管理操作
+    - 仮想環境 `.venv` の新規作成
+        ```
+        /usr/bin/python3 -m venv .venv
+        ```
+    - 仮想環境 `.venv` へのパッケージインストール（権限昇格付きでの実行をユーザーに依頼すること）
+        ```
+        ./.venv/bin/python -m pip install -e ."[test]"
+        ```
+    - `.venv` への新規パッケージの追加
+        - `pyporject.toml` に依存関係を追記する
+        - 上記「仮想環境 `.venv` へのパッケージインストール」を実行
 
 # コーディングにおける AI エージェント行動原則
 
@@ -74,13 +84,16 @@
 - 型ヒント (type hint)
     - 必ず書く
     - 必要以上に `Any` を使わない
+- パッケージ管理
+    - 必要なパッケージが `.venv` に入っていない場合は `pyproject.toml` に設定を書いたうえで `.venv` を再生成する
+    - それ以外のワークアラウンド的対応は禁止
 - import のルール
     - `src/` をルートとした import が可能であることを前提とする
     - 可能ならば、 `.` を起点とする相対パスでの `import` を行う
     - 相対パスでの `import` が不可能な場合のみ、絶対パスでの `import` を行う
 - `from __future__ import annotations` は禁止
     - 型チェッカー (pylance) と実行時の挙動を揃えるためのルールである
-- `import` による循環参照の回避方法が起きた場合
+- `import` による循環参照の回避方法
     - モジュールの細分化・構造の調整による循環参照回避を試みること
     - どうしても回避不能な場合のみ `TYPE_CHECKING` を使っても良い
 - 型チェックについて

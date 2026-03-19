@@ -4,7 +4,13 @@
 			"path": "."
 		}
 	],
-	"settings": {},
+	"settings": {
+		"files.exclude": {
+			"**/__pycache__": true,
+			"**/*.egg-info": true,
+			".pytest_cache": true
+		}
+	},
 	"extensions": {
 		"recommendations": [
 			"ms-vscode-remote.vscode-remote-extensionpack",
