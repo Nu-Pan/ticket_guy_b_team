@@ -49,6 +49,17 @@ def parse_json_output(exit_code: int, stdout: str, stderr: str) -> Any:
     return json.loads(stdout)
 
 
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """JSONL ログを読み込む。"""
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def latest_path(paths: list[Path]) -> Path:
+    """ソート済みの末尾を返す。"""
+    assert paths
+    return sorted(paths)[-1]
+
+
 def prepare_approvable_plan(plan_path: Path, replacements: dict[str, str]) -> None:
     """承認可能な内容へ最小限書き換える。"""
     text = plan_path.read_text(encoding="utf-8")
@@ -91,6 +102,12 @@ def test_plan_to_ticket_and_run_root_flow(tmp_path: Path) -> None:
     result = parse_json_output(exit_code, stdout, stderr)
     assert isinstance(result, list)
     assert [item["status"] for item in result] == ["review_pending", "done", "done", "done"]
+    worker_log_path = latest_path(list((tmp_path / "artifacts" / "logs").glob(f"{result[0]['ticket_id']}-*.jsonl")))
+    worker_log = read_jsonl(worker_log_path)
+    events = [entry["event"] for entry in worker_log]
+    assert "run_started" in events
+    assert "dependency_check" in events
+    assert "run_finished" in events
 
     exit_code, stdout, stderr = run_cli(tmp_path, "review", "queue")
     queue = parse_json_output(exit_code, stdout, stderr)
@@ -99,7 +116,8 @@ def test_plan_to_ticket_and_run_root_flow(tmp_path: Path) -> None:
     exit_code, stdout, stderr = run_cli(tmp_path, "artifacts", plan_id)
     artifacts = parse_json_output(exit_code, stdout, stderr)
     artifact_paths = {item["path"]: item["exists"] for item in artifacts["items"]}
-    assert any(path.endswith(".log") and exists == "true" for path, exists in artifact_paths.items())
+    assert any(path.endswith(".jsonl") and exists == "true" for path, exists in artifact_paths.items())
+    assert any(path.endswith(".txt") and exists == "false" for path, exists in artifact_paths.items())
     assert any(path.endswith(".md") and exists == "true" for path, exists in artifact_paths.items())
 
 
@@ -196,8 +214,12 @@ def test_internal_helpers_cover_error_paths(tmp_path: Path) -> None:
     ]
 
     main.ensure_artifact_dirs(tmp_path)
-    log_path = main.write_log("sample", "message", tmp_path)
+    log_path = tmp_path / "artifacts" / "logs" / "sample.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    main.write_log(log_path, "message")
     assert log_path.exists()
+    main.write_log(log_path, "message2")
+    assert "message\nmessage2\n" == log_path.read_text(encoding="utf-8")
     review_path = main.write_review_result("review-1", "worker-1", "pass", False, tmp_path)
     assert review_path.exists()
 
@@ -312,6 +334,9 @@ def test_production_mode_runs_codex_then_pytest_gate(
                 'def hello() -> str:\n    """挨拶を返す。"""\n    return "ok"\n',
                 encoding="utf-8",
             )
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text("final message\n", encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, "codex stdout", "codex stderr")
         return original_run(*args, **kwargs)
 
@@ -323,6 +348,8 @@ def test_production_mode_runs_codex_then_pytest_gate(
     assert codex_commands
     assert codex_commands[0][0:3] == ["codex", "exec", "--model"]
     assert "gpt-5.1-codex-mini" in codex_commands[0]
+    assert "--output-last-message" in codex_commands[0]
+    assert codex_commands[0][codex_commands[0].index("--output-last-message") + 1].endswith(".txt")
 
     review_result = main.run_ticket(review_id, tmp_path, config)
     assert review_result["status"] == "done"
@@ -332,6 +359,16 @@ def test_production_mode_runs_codex_then_pytest_gate(
     assert integration_result["status"] == "done"
     root_result = main.run_ticket(root_id, tmp_path, config)
     assert root_result["status"] == "done"
+    review_log_path = latest_path(list((tmp_path / "artifacts" / "logs").glob(f"{review_id}-*.jsonl")))
+    review_log = read_jsonl(review_log_path)
+    assert any(entry["event"] == "acceptance_gate" for entry in review_log)
+    assert any("command" in entry for entry in review_log if entry["event"] == "acceptance_gate")
+    worker_log_path = latest_path(list((tmp_path / "artifacts" / "logs").glob(f"{worker_id}-*.jsonl")))
+    worker_log = read_jsonl(worker_log_path)
+    assert any(entry["event"] == "external_command" for entry in worker_log)
+    assert any(entry["event"] == "status_transition" for entry in worker_log)
+    worker_message_path = latest_path(list((tmp_path / "artifacts" / "messages").glob(f"{worker_id}-*.txt")))
+    assert worker_message_path.read_text(encoding="utf-8") == "final message\n"
 
     completed = original_run(
         [sys.executable, "-m", "pytest", "-q"],

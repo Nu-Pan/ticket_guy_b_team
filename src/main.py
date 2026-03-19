@@ -47,6 +47,7 @@ PLAN_STATUSES = {"draft", "in_review", "approved"}
 TICKET_STATUSES = {"todo", "blocked", "running", "review_pending", "done", "failed"}
 REVIEW_RESULTS = {"pass", "fail"}
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+RUN_ID_FORMAT = "%Y%m%d%H%M%S%f"
 DEFAULT_PRIORITY = "high"
 RUN_MODES = {"dry-run", "production"}
 DEFAULT_PRODUCTION_MODEL = "gpt-5.4"
@@ -81,6 +82,15 @@ class RunConfig:
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
 
 
+@dataclass(frozen=True)
+class RunArtifacts:
+    """1 回の ticket 実行で使う成果物パスを表す。"""
+
+    run_id: str
+    log_path: Path
+    message_path: Path
+
+
 class RunState(TypedDict):
     """LangGraph が流す実行状態。"""
 
@@ -95,6 +105,11 @@ class RunState(TypedDict):
 def utc_now() -> str:
     """現在時刻を UTC 文字列で返す。"""
     return datetime.now(timezone.utc).strftime(TIMESTAMP_FORMAT)
+
+
+def generate_run_id() -> str:
+    """ログファイル名に使う実行 ID を返す。"""
+    return datetime.now(timezone.utc).strftime(RUN_ID_FORMAT)
 
 
 def repo_root() -> Path:
@@ -115,7 +130,7 @@ def artifacts_root(base_dir: Path | None = None) -> Path:
 def ensure_artifact_dirs(base_dir: Path | None = None) -> None:
     """必要な成果物ディレクトリを作成する。"""
     root = artifacts_root(base_dir)
-    for relative in ["plans", "tickets", "reviews", "logs"]:
+    for relative in ["plans", "tickets", "reviews", "logs", "messages"]:
         (root / relative).mkdir(parents=True, exist_ok=True)
 
 
@@ -294,7 +309,7 @@ def build_ticket_body(title: str, purpose: str, outputs: list[str], dependencies
     dependency_lines = ["- なし"] if not dependencies else [
         f"- {dependency.ticket_id} ({dependency.required_state})" for dependency in dependencies
     ]
-    output_lines = [f"- {output}" for output in outputs]
+    output_lines = ["- なし"] if not outputs else [f"- {output}" for output in outputs]
     sections: dict[str, list[str]] = {
         "Title": [title],
         "Purpose": [purpose],
@@ -352,12 +367,82 @@ def load_plan(plan_id: str, base_dir: Path | None = None) -> Document:
     return parse_document(artifacts_root(base_dir) / "plans" / f"{plan_id}.md")
 
 
-def write_log(ticket_id: str, message: str, base_dir: Path | None = None) -> Path:
-    """ログファイルを保存する。"""
-    path = artifacts_root(base_dir) / "logs" / f"{ticket_id}.log"
+def build_run_artifacts(ticket_id: str, base_dir: Path | None = None, run_id: str | None = None) -> RunArtifacts:
+    """実行ごとのログ保存先を組み立てる。"""
+    resolved_run_id = run_id or generate_run_id()
+    root = artifacts_root(base_dir)
+    return RunArtifacts(
+        run_id=resolved_run_id,
+        log_path=root / "logs" / f"{ticket_id}-{resolved_run_id}.jsonl",
+        message_path=root / "messages" / f"{ticket_id}-{resolved_run_id}.txt",
+    )
+
+
+def latest_log_path_from_metadata(metadata: Mapping[str, object], base_dir: Path | None = None) -> Path | None:
+    """チケット metadata に保存された最新ログパスを返す。"""
+    raw_path = metadata.get("latest_log_path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    return runtime_root(base_dir) / raw_path
+
+
+def write_log(path: Path, message: str) -> Path:
+    """ログファイルへ生文字列を追記する。"""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(message.rstrip() + "\n", encoding="utf-8")
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(message.rstrip() + "\n")
     return path
+
+
+def reset_log(path: Path) -> Path:
+    """ログファイルを新規作成し直す。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("", encoding="utf-8")
+    return path
+
+
+def log_event(
+    ticket_id: str,
+    event: str,
+    log_path: Path,
+    **fields: object,
+) -> Path:
+    """JSONL 形式のイベントログを追記する。"""
+    payload: dict[str, object] = {
+        "timestamp": utc_now(),
+        "event": event,
+        "ticket_id": ticket_id,
+    }
+    for key, value in fields.items():
+        if value is not None:
+            payload[key] = value
+    return write_log(log_path, json.dumps(payload, ensure_ascii=False))
+
+
+def update_ticket_status(
+    ticket_id: str,
+    next_status: str,
+    base_dir: Path | None = None,
+    *,
+    reason: str = "",
+    log_path: Path | None = None,
+) -> None:
+    """チケット状態を更新し、状態遷移をログへ残す。"""
+    document = load_ticket(ticket_id, base_dir)
+    previous_status = str(document.metadata.get("status"))
+    document.metadata["status"] = next_status
+    write_ticket(ticket_id, document.metadata, document.body, base_dir)
+    resolved_log_path = log_path or latest_log_path_from_metadata(document.metadata, base_dir)
+    if resolved_log_path is None:
+        resolved_log_path = artifacts_root(base_dir) / "logs" / f"{ticket_id}.jsonl"
+    log_event(
+        ticket_id,
+        "status_transition",
+        resolved_log_path,
+        before=previous_status,
+        after=next_status,
+        reason=reason,
+    )
 
 
 def write_review_result(
@@ -509,11 +594,17 @@ def build_ticket_set(plan_id: str, base_dir: Path | None = None) -> list[Path]:
             "priority": DEFAULT_PRIORITY,
             "plan_id": plan_id,
             "dependencies": [],
-            "outputs": [f"artifacts/logs/{worker_id}.log"],
+            "outputs": [
+                f"artifacts/logs/{worker_id}-<run_id>.jsonl",
+                f"artifacts/messages/{worker_id}-<run_id>.txt",
+            ],
             "body": build_ticket_body(
                 title=f"Implement {slug}",
                 purpose="承認済み計画に対する最小実装とローカル検証を行う",
-                outputs=[f"artifacts/logs/{worker_id}.log"],
+                outputs=[
+                    f"artifacts/logs/{worker_id}-<run_id>.jsonl",
+                    f"artifacts/messages/{worker_id}-<run_id>.txt",
+                ],
                 dependencies=[],
             ),
         },
@@ -560,11 +651,11 @@ def build_ticket_set(plan_id: str, base_dir: Path | None = None) -> list[Path]:
             "plan_id": plan_id,
             "dependencies": [{"ticket_id": integration_id, "required_state": "done"}],
             "children": [worker_id, review_id, integration_id],
-            "outputs": [f"artifacts/logs/{root_id}.log"],
+            "outputs": [f"artifacts/logs/{root_id}-<run_id>.jsonl"],
             "body": build_ticket_body(
                 title=f"Root {slug}",
                 purpose="配下チケットの依存に従って実行全体を管理する",
-                outputs=[f"artifacts/logs/{root_id}.log"],
+                outputs=[f"artifacts/logs/{root_id}-<run_id>.jsonl"],
                 dependencies=[Dependency(integration_id, "done")],
             ),
         },
@@ -589,24 +680,19 @@ def dependency_satisfied(dependency: Dependency, base_dir: Path | None = None) -
     return str(document.metadata.get("status")) == dependency.required_state
 
 
-def update_ticket_status(ticket_id: str, next_status: str, base_dir: Path | None = None) -> None:
-    """チケット状態を更新する。"""
-    document = load_ticket(ticket_id, base_dir)
-    document.metadata["status"] = next_status
-    write_ticket(ticket_id, document.metadata, document.body, base_dir)
-
-
 def create_run_graph(
     base_dir: Path | None = None,
     run_config: RunConfig | None = None,
+    run_artifacts: RunArtifacts | None = None,
 ) -> Callable[[RunState], RunState]:
     """実行モードごとのワークフローを構築する。"""
     config = run_config or RunConfig()
+    artifacts = run_artifacts or build_run_artifacts("unknown", base_dir)
     graph = StateGraph(RunState)
-    graph.add_node("load", cast(Any, lambda state: node_load(cast(RunState, state), base_dir)))
-    graph.add_node("check", cast(Any, lambda state: node_check_dependencies(cast(RunState, state), base_dir)))
-    graph.add_node("execute", cast(Any, lambda state: node_execute(cast(RunState, state), base_dir, config)))
-    graph.add_node("finalize", cast(Any, lambda state: node_finalize(cast(RunState, state), base_dir)))
+    graph.add_node("load", cast(Any, lambda state: node_load(cast(RunState, state), base_dir, artifacts)))
+    graph.add_node("check", cast(Any, lambda state: node_check_dependencies(cast(RunState, state), base_dir, artifacts)))
+    graph.add_node("execute", cast(Any, lambda state: node_execute(cast(RunState, state), base_dir, config, artifacts)))
+    graph.add_node("finalize", cast(Any, lambda state: node_finalize(cast(RunState, state), base_dir, artifacts)))
     graph.set_entry_point("load")
     graph.add_edge("load", "check")
     graph.add_conditional_edges(
@@ -619,53 +705,99 @@ def create_run_graph(
     return cast(Callable[[RunState], RunState], graph.compile().invoke)
 
 
-def node_load(state: RunState, base_dir: Path | None) -> RunState:
+def node_load(state: RunState, base_dir: Path | None, run_artifacts: RunArtifacts) -> RunState:
     """チケット文書を読み込む。"""
     ticket_id = str(state["ticket_id"])
     document = load_ticket(ticket_id, base_dir)
     errors = validate_ticket_document(document)
     if errors:
         raise typer.Exit(1, "\n".join(errors))
+    log_event(
+        ticket_id,
+        "run_load",
+        run_artifacts.log_path,
+        plan_id=document.metadata.get("plan_id"),
+        ticket_type=document.metadata.get("ticket_type"),
+        status=document.metadata.get("status"),
+    )
     state["document"] = document
     state["dependencies"] = parse_dependencies(document.metadata)
     return state
 
 
-def node_check_dependencies(state: RunState, base_dir: Path | None) -> RunState:
+def node_check_dependencies(state: RunState, base_dir: Path | None, run_artifacts: RunArtifacts) -> RunState:
     """依存解決可否を確認する。"""
     dependencies = cast(list[Dependency], state.get("dependencies", []))
     missing = [dependency for dependency in dependencies if not dependency_satisfied(dependency, base_dir)]
     state["dependencies_ok"] = not missing
     state["missing_dependencies"] = missing
+    log_event(
+        str(cast(Document, state.get("document")).metadata["ticket_id"]),
+        "dependency_check",
+        run_artifacts.log_path,
+        dependencies=[dependency.__dict__ for dependency in dependencies],
+        missing=[dependency.__dict__ for dependency in missing],
+        dependencies_ok=not missing,
+    )
     return state
 
 
-def node_execute(state: RunState, base_dir: Path | None, run_config: RunConfig) -> RunState:
+def node_execute(
+    state: RunState,
+    base_dir: Path | None,
+    run_config: RunConfig,
+    run_artifacts: RunArtifacts,
+) -> RunState:
     """チケット種別ごとの処理を実行する。"""
     document = cast(Document, state.get("document"))
     metadata = document.metadata
     ticket_id = str(metadata["ticket_id"])
     ticket_type = str(metadata["ticket_type"])
+    previous_status = str(metadata.get("status"))
     metadata["status"] = "running"
     write_ticket(ticket_id, metadata, document.body, base_dir)
+    log_event(
+        ticket_id,
+        "status_transition",
+        run_artifacts.log_path,
+        before=previous_status,
+        after="running",
+        reason="execution started",
+    )
+    log_event(
+        ticket_id,
+        "execute_start",
+        run_artifacts.log_path,
+        ticket_type=ticket_type,
+        mode=run_config.mode,
+        model=run_config.model,
+        reasoning_effort=run_config.reasoning_effort,
+    )
 
     # 種別とモードごとの最小処理を行う。
     if ticket_type == "worker":
-        result = execute_worker_ticket(ticket_id, metadata, base_dir, run_config)
+        result = execute_worker_ticket(ticket_id, metadata, base_dir, run_config, run_artifacts)
     elif ticket_type == "review":
-        result = execute_review_ticket(ticket_id, metadata, base_dir, run_config)
+        result = execute_review_ticket(ticket_id, metadata, base_dir, run_config, run_artifacts)
     elif ticket_type == "integration":
-        result = execute_integration_ticket(ticket_id, metadata, base_dir, run_config)
+        result = execute_integration_ticket(ticket_id, metadata, base_dir, run_config, run_artifacts)
     elif ticket_type == "root":
-        result = execute_root_ticket(ticket_id, metadata, base_dir)
+        result = execute_root_ticket(ticket_id, metadata, base_dir, run_artifacts)
     else:
         metadata["status"] = "failed"
-        log_path = write_log(ticket_id, f"unknown ticket type: {ticket_type}", base_dir)
-        result = [str(log_path.relative_to(runtime_root(base_dir)))]
+        log_event(ticket_id, "execute_unknown_ticket_type", run_artifacts.log_path, ticket_type=ticket_type)
+        result = [str(run_artifacts.log_path.relative_to(runtime_root(base_dir)))]
 
     state["artifacts"] = result
     write_ticket(ticket_id, metadata, document.body, base_dir)
     state["document"] = load_ticket(ticket_id, base_dir)
+    log_event(
+        ticket_id,
+        "execute_end",
+        run_artifacts.log_path,
+        status=metadata.get("status"),
+        artifacts=result,
+    )
     return state
 
 
@@ -674,19 +806,47 @@ def execute_worker_ticket(
     metadata: dict[str, object],
     base_dir: Path | None,
     run_config: RunConfig,
+    run_artifacts: RunArtifacts,
 ) -> list[str]:
     """worker ticket を実行する。"""
     if run_config.mode == "dry-run":
-        log_path = write_log(ticket_id, "worker executed in dry run mode", base_dir)
+        log_event(ticket_id, "worker_dry_run", run_artifacts.log_path, mode=run_config.mode)
         metadata["status"] = "review_pending"
-        return [str(log_path.relative_to(runtime_root(base_dir)))]
+        log_event(
+            ticket_id,
+            "status_transition",
+            run_artifacts.log_path,
+            before="running",
+            after="review_pending",
+            reason="dry run completed",
+        )
+        return [str(run_artifacts.log_path.relative_to(runtime_root(base_dir)))]
 
-    completed = run_codex_for_ticket(ticket_id, metadata, base_dir, run_config)
+    completed = run_codex_for_ticket(ticket_id, metadata, base_dir, run_config, run_artifacts)
     if completed.returncode == 0:
         metadata["status"] = "review_pending"
+        log_event(
+            ticket_id,
+            "status_transition",
+            run_artifacts.log_path,
+            before="running",
+            after="review_pending",
+            reason="codex execution completed",
+        )
     else:
         metadata["status"] = "failed"
-    return [f"artifacts/logs/{ticket_id}.log"]
+        log_event(
+            ticket_id,
+            "status_transition",
+            run_artifacts.log_path,
+            before="running",
+            after="failed",
+            reason="codex execution failed",
+        )
+    artifacts = [str(run_artifacts.log_path.relative_to(runtime_root(base_dir)))]
+    if run_artifacts.message_path.exists():
+        artifacts.append(str(run_artifacts.message_path.relative_to(runtime_root(base_dir))))
+    return artifacts
 
 
 def execute_review_ticket(
@@ -694,6 +854,7 @@ def execute_review_ticket(
     metadata: dict[str, object],
     base_dir: Path | None,
     run_config: RunConfig,
+    run_artifacts: RunArtifacts,
 ) -> list[str]:
     """review ticket を実行する。"""
     target_ticket_id = str(metadata.get("target_ticket_id", ""))
@@ -701,21 +862,55 @@ def execute_review_ticket(
     target_status = str(target_document.metadata.get("status"))
     if target_status != "review_pending":
         metadata["status"] = "blocked"
-        write_log(ticket_id, "review blocked because target is not review_pending", base_dir)
+        log_event(
+            ticket_id,
+            "review_blocked",
+            run_artifacts.log_path,
+            target_ticket_id=target_ticket_id,
+            target_status=target_status,
+            reason="target is not review_pending",
+        )
         return []
 
     if run_config.mode == "dry-run":
         review_path = write_review_result(ticket_id, target_ticket_id, "pass", False, base_dir)
         metadata["status"] = "done"
-        update_ticket_status(target_ticket_id, "done", base_dir)
-        return [str(review_path.relative_to(runtime_root(base_dir)))]
+        log_event(
+            ticket_id,
+            "status_transition",
+            run_artifacts.log_path,
+            before="running",
+            after="done",
+            reason="dry run review passed",
+        )
+        update_ticket_status(target_ticket_id, "done", base_dir, reason=f"review ticket {ticket_id} passed")
+        return [
+            str(review_path.relative_to(runtime_root(base_dir))),
+            str(run_artifacts.log_path.relative_to(runtime_root(base_dir))),
+        ]
 
     passed, details = run_acceptance_gate(ticket_id, base_dir)
-    write_log(ticket_id, details, base_dir)
+    log_event(ticket_id, "acceptance_gate", run_artifacts.log_path, **details)
     review_path = write_review_result(ticket_id, target_ticket_id, "pass" if passed else "fail", not passed, base_dir)
     metadata["status"] = "done" if passed else "failed"
-    update_ticket_status(target_ticket_id, "done" if passed else "failed", base_dir)
-    return [str(review_path.relative_to(runtime_root(base_dir))), f"artifacts/logs/{ticket_id}.log"]
+    log_event(
+        ticket_id,
+        "status_transition",
+        run_artifacts.log_path,
+        before="running",
+        after=metadata["status"],
+        reason="acceptance gate completed",
+    )
+    update_ticket_status(
+        target_ticket_id,
+        "done" if passed else "failed",
+        base_dir,
+        reason=f"review ticket {ticket_id} {'passed' if passed else 'failed'}",
+    )
+    return [
+        str(review_path.relative_to(runtime_root(base_dir))),
+        str(run_artifacts.log_path.relative_to(runtime_root(base_dir))),
+    ]
 
 
 def execute_integration_ticket(
@@ -723,22 +918,50 @@ def execute_integration_ticket(
     metadata: dict[str, object],
     base_dir: Path | None,
     run_config: RunConfig,
+    run_artifacts: RunArtifacts,
 ) -> list[str]:
     """integration ticket を実行する。"""
     target_ticket_id = str(metadata.get("target_ticket_id", ""))
     if run_config.mode == "dry-run":
         review_path = write_review_result(ticket_id, target_ticket_id, "pass", False, base_dir)
         metadata["status"] = "done"
-        return [str(review_path.relative_to(runtime_root(base_dir)))]
+        log_event(
+            ticket_id,
+            "status_transition",
+            run_artifacts.log_path,
+            before="running",
+            after="done",
+            reason="dry run integration passed",
+        )
+        return [
+            str(review_path.relative_to(runtime_root(base_dir))),
+            str(run_artifacts.log_path.relative_to(runtime_root(base_dir))),
+        ]
 
     passed, details = run_acceptance_gate(ticket_id, base_dir)
-    write_log(ticket_id, details, base_dir)
+    log_event(ticket_id, "acceptance_gate", run_artifacts.log_path, **details)
     review_path = write_review_result(ticket_id, target_ticket_id, "pass" if passed else "fail", not passed, base_dir)
     metadata["status"] = "done" if passed else "failed"
-    return [str(review_path.relative_to(runtime_root(base_dir))), f"artifacts/logs/{ticket_id}.log"]
+    log_event(
+        ticket_id,
+        "status_transition",
+        run_artifacts.log_path,
+        before="running",
+        after=metadata["status"],
+        reason="integration gate completed",
+    )
+    return [
+        str(review_path.relative_to(runtime_root(base_dir))),
+        str(run_artifacts.log_path.relative_to(runtime_root(base_dir))),
+    ]
 
 
-def execute_root_ticket(ticket_id: str, metadata: dict[str, object], base_dir: Path | None) -> list[str]:
+def execute_root_ticket(
+    ticket_id: str,
+    metadata: dict[str, object],
+    base_dir: Path | None,
+    run_artifacts: RunArtifacts,
+) -> list[str]:
     """root ticket を実行する。"""
     children = metadata.get("children", [])
     if not isinstance(children, list):
@@ -748,8 +971,8 @@ def execute_root_ticket(ticket_id: str, metadata: dict[str, object], base_dir: P
         metadata["status"] = "done"
     else:
         metadata["status"] = "running"
-    log_path = write_log(ticket_id, f"root evaluated children={json.dumps(child_ids)}", base_dir)
-    return [str(log_path.relative_to(runtime_root(base_dir)))]
+    log_event(ticket_id, "root_evaluated_children", run_artifacts.log_path, children=child_ids, status=metadata["status"])
+    return [str(run_artifacts.log_path.relative_to(runtime_root(base_dir)))]
 
 
 def build_codex_prompt(ticket_id: str, metadata: dict[str, object], base_dir: Path | None) -> str:
@@ -775,9 +998,9 @@ def run_codex_for_ticket(
     metadata: dict[str, object],
     base_dir: Path | None,
     run_config: RunConfig,
+    run_artifacts: RunArtifacts,
 ) -> subprocess.CompletedProcess[str]:
     """Codex CLI を呼び出して worker ticket を実行する。"""
-    log_path = artifacts_root(base_dir) / "logs" / f"{ticket_id}.log"
     prompt = build_codex_prompt(ticket_id, metadata, base_dir)
     command = [
         "codex",
@@ -792,7 +1015,7 @@ def run_codex_for_ticket(
         "--cd",
         str(runtime_root(base_dir)),
         "--output-last-message",
-        str(log_path),
+        str(run_artifacts.message_path),
         prompt,
     ]
     completed = subprocess.run(
@@ -801,44 +1024,48 @@ def run_codex_for_ticket(
         capture_output=True,
         text=True,
     )
-    # Codex の stdout/stderr も同じログに追記して、失敗調査を容易にする。
-    log_lines = [
-        "[stdout]",
-        completed.stdout.rstrip(),
-        "",
-        "[stderr]",
-        completed.stderr.rstrip(),
-    ]
-    write_log(ticket_id, "\n".join(log_lines), base_dir)
+    log_event(
+        ticket_id,
+        "external_command",
+        run_artifacts.log_path,
+        command=command,
+        returncode=completed.returncode,
+        stdout=completed.stdout.rstrip(),
+        stderr=completed.stderr.rstrip(),
+    )
     return completed
 
 
-def run_acceptance_gate(ticket_id: str, base_dir: Path | None) -> tuple[bool, str]:
+def run_acceptance_gate(ticket_id: str, base_dir: Path | None) -> tuple[bool, dict[str, object]]:
     """本番モードの review / integration 用受け入れゲートを実行する。"""
     workdir = runtime_root(base_dir)
     tests_dir = workdir / "tests"
     if not tests_dir.exists():
-        return True, "no tests directory; existence check only"
+        return True, {
+            "command": None,
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "result": "no tests directory; existence check only",
+        }
 
+    command = [sys.executable, "-m", "pytest", "-q"]
     completed = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q"],
+        command,
         check=False,
         capture_output=True,
         text=True,
         cwd=workdir,
     )
-    log_lines = [
-        f"acceptance gate for {ticket_id}",
-        "[stdout]",
-        completed.stdout.rstrip(),
-        "",
-        "[stderr]",
-        completed.stderr.rstrip(),
-    ]
-    return completed.returncode == 0, "\n".join(log_lines)
+    return completed.returncode == 0, {
+        "command": command,
+        "returncode": completed.returncode,
+        "stdout": completed.stdout.rstrip(),
+        "stderr": completed.stderr.rstrip(),
+    }
 
 
-def node_finalize(state: RunState, base_dir: Path | None) -> RunState:
+def node_finalize(state: RunState, base_dir: Path | None, run_artifacts: RunArtifacts) -> RunState:
     """依存未解決時や終了時の状態を確定する。"""
     document = cast(Document, state.get("document"))
     metadata = document.metadata
@@ -848,7 +1075,15 @@ def node_finalize(state: RunState, base_dir: Path | None) -> RunState:
             {"ticket_id": dependency.ticket_id, "required_state": dependency.required_state}
             for dependency in cast(list[Dependency], state.get("missing_dependencies", []))
         ]
-        write_log(str(metadata["ticket_id"]), f"blocked: {json.dumps(missing)}", base_dir)
+        log_event(
+            str(metadata["ticket_id"]),
+            "status_transition",
+            run_artifacts.log_path,
+            before="running",
+            after="blocked",
+            reason="missing dependencies",
+            missing_dependencies=missing,
+        )
         write_ticket(str(metadata["ticket_id"]), metadata, document.body, base_dir)
         state["document"] = load_ticket(str(metadata["ticket_id"]), base_dir)
     return state
@@ -862,19 +1097,42 @@ def run_ticket(
     """単一チケットを実行する。"""
     ensure_artifact_dirs(base_dir)
     config = run_config or RunConfig()
-    state = create_run_graph(base_dir, config)({"ticket_id": ticket_id})
+    run_artifacts = build_run_artifacts(ticket_id, base_dir)
+    reset_log(run_artifacts.log_path)
+    document = load_ticket(ticket_id, base_dir)
+    # 実行ごとの成果物を後続チケットや artifact 一覧から辿れるようにする。
+    document.metadata["latest_run_id"] = run_artifacts.run_id
+    document.metadata["latest_log_path"] = str(run_artifacts.log_path.relative_to(runtime_root(base_dir)))
+    document.metadata["latest_message_path"] = str(run_artifacts.message_path.relative_to(runtime_root(base_dir)))
+    write_ticket(ticket_id, document.metadata, document.body, base_dir)
+    log_event(
+        ticket_id,
+        "run_started",
+        run_artifacts.log_path,
+        plan_id=document.metadata.get("plan_id"),
+        ticket_type=document.metadata.get("ticket_type"),
+        initial_status=document.metadata.get("status"),
+        mode=config.mode,
+        model=config.model,
+        reasoning_effort=config.reasoning_effort,
+        run_id=run_artifacts.run_id,
+    )
+    state = create_run_graph(base_dir, config, run_artifacts)({"ticket_id": ticket_id})
     document = cast(Document, state.get("document"))
     metadata = document.metadata
-    return {
+    result = {
         "ticket_id": metadata["ticket_id"],
         "ticket_type": metadata["ticket_type"],
         "status": metadata["status"],
+        "run_id": run_artifacts.run_id,
         "artifacts": state.get("artifacts", []),
         "missing_dependencies": [
             {"ticket_id": dependency.ticket_id, "required_state": dependency.required_state}
             for dependency in cast(list[Dependency], state.get("missing_dependencies", []))
         ],
     }
+    log_event(ticket_id, "run_finished", run_artifacts.log_path, result=result)
+    return result
 
 
 def run_root_ticket(
@@ -939,10 +1197,15 @@ def collect_artifacts(identifier: str, base_dir: Path | None = None) -> dict[str
                     {"kind": "output", "path": str(output), "exists": str(output_path.exists()).lower()}
                 )
         review_path = root / "reviews" / f"{identifier}.md"
-        log_path = root / "logs" / f"{identifier}.log"
-        for kind, path in [("review", review_path), ("log", log_path)]:
+        for kind, path in [("review", review_path)]:
             result["items"].append(
                 {"kind": kind, "path": str(path.relative_to(runtime_root(base_dir))), "exists": str(path.exists()).lower()}
+            )
+        for path in sorted((root / "logs").glob(f"{identifier}-*.jsonl")):
+            result["items"].append({"kind": "log", "path": str(path.relative_to(runtime_root(base_dir))), "exists": "true"})
+        for path in sorted((root / "messages").glob(f"{identifier}-*.txt")):
+            result["items"].append(
+                {"kind": "message", "path": str(path.relative_to(runtime_root(base_dir))), "exists": "true"}
             )
         return result
     raise typer.Exit(1, f"identifier not found: {identifier}")
