@@ -1,14 +1,14 @@
-# `ticket_guy_b_team` State Machine Specification
+# `ticket_guys_b_team` State Machine Specification
 
 ## 1. 文書の目的
 
-本書は `ticket_guy_b_team` における状態遷移仕様を定義する。
+本書は `ticket_guys_b_team` における状態遷移仕様を定義する。
 対象は以下の 2 系統である。
 
 * Plan の状態遷移
 * Ticket の状態遷移
 
-本書はステートマシンの定義に集中し、CLI 契約、ファイル形式、製品背景説明は扱わない。
+本書は状態遷移の定義に集中し、CLI 契約、ファイル形式、製品背景説明は扱わない。
 
 ---
 

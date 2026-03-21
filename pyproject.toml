@@ -5,7 +5,7 @@ requires = ["setuptools>=45", "wheel"]
 name = "ticket-guy-b-team"
 readme = "README.md"
 license = {file = "LICENSE"}
-urls = {repository = "https://github.com/Nu-Pan/ticket_guy_b_team"}
+urls = {repository = "https://github.com/Nu-Pan/ticket_guys_b_team"}
 
 dynamic = ["version"]
 requires-python = ">=3.12"

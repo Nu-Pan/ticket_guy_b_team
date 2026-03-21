@@ -1,10 +1,10 @@
 # 前提
 
-- このリポジトリでは `ticket_guy_b_team` を開発する
+- このリポジトリでは `ticket_guys_b_team` を開発する
 - アプリケーションの仕様は `doc/*.md` に書いてある
 - 人間向けの説明は `README.md` に書いてある
-- この `AGENTS.md` には「`ticket_guy_b_team` 自体の開発中に遵守するべき AI エージェントの行動原則」だけが書かれている
-- 「`ticket_guy_b_team` が実現する AI エージェントのワークフロー」と「`ticket_guy_b_team` 自体の開発中に遵守するべき AI エージェントの行動原則」は異なる
+- この `AGENTS.md` には「`ticket_guys_b_team` 自体の開発中に遵守するべき AI エージェントの行動原則」だけが書かれている
+- 「`ticket_guys_b_team` が実現する AI エージェントのワークフロー」と「`ticket_guys_b_team` 自体の開発中に遵守するべき AI エージェントの行動原則」は異なる
 
 # 基本的な AI エージェント行動原則
 
@@ -49,7 +49,7 @@ Always use the OpenAI developer documentation MCP server if you need to work wit
 
 - WSL2 Ubuntu 24.04 on Windows 11
 - vscode (with Remote Develpment Extension)
-- `ticket_guy_b_team.code-workspace` を vscode を開いた環境
+- `ticket_guys_b_team.code-workspace` を vscode を開いた環境
 - Codex CLI が利用可能
 
 ## ファイルエンコード

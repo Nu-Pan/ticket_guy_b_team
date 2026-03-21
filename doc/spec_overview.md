@@ -1,10 +1,10 @@
-# `ticket_guy_b_team` Specification Overview
+# `ticket_guys_b_team` Specification Overview
 
 ## 1. 文書の目的
 
-本書は `ticket_guy_b_team` の仕様群に対する入口文書である。
+本書は `ticket_guys_b_team` の仕様群に対する入口文書である。
 
-`ticket_guy_b_team` は、**仕様レビュー駆動のマルチエージェント開発**を、人間が扱いやすい業務概念で運用するための CLI フロントエンドである。
+`ticket_guys_b_team` は、**仕様レビュー駆動のマルチエージェント開発**を、人間が扱いやすい業務概念で運用するための CLI フロントエンドである。
 
 本プロダクトの主目的は、エージェントそのものの賢さを追求することではなく、以下を扱いやすくすることである。
 
@@ -142,7 +142,7 @@
 
 * 本書は入口と参照案内のみを担う
 * `product-vision.md` は背景・目的・設計思想を担う
-* `state-machine.md` はステートマシンだけを担う
+* `state-machine.md` は状態遷移だけを担う
 * `file-format.md` はファイル形式だけを担う
 * `cli-contract.md` は CLI 契約だけを担う
 

@@ -1,4 +1,4 @@
-# ticket_guy_b_team 用の Codex 設定。
+# ticket_guys_b_team 用の Codex 設定。
 # 既定モデルに加えて、マルチエージェント運用で必要になる役割、
 # 成果物配置、品質ゲート、停止条件を明示する。
 
@@ -11,6 +11,6 @@ model_reasoning_effort = "high"
 personality = "pragmatic"
 
 [project]
-name = "ticket_guy_b_team"
+name = "ticket_guys_b_team"
 language = "ja"
 primary_interface = "cli"

@@ -1,8 +1,8 @@
-# `ticket_guy_b_team` CLI Contract
+# `ticket_guys_b_team` CLI Contract
 
 ## 1. 文書の目的
 
-本書は `ticket_guy_b_team` の CLI 契約を定義する。
+本書は `ticket_guys_b_team` の CLI 契約を定義する。
 対象は以下とする。
 
 * CLI の責務
@@ -11,7 +11,7 @@
 * 各コマンドの入力、出力、前提条件、失敗条件
 * MVP の制約
 
-本書は CLI 利用者および CLI 実装者向けの契約文書であり、詳細なファイル形式やステートマシンそのものは別文書を参照する。
+本書は CLI 利用者および CLI 実装者向けの契約文書であり、詳細なファイル形式や状態遷移そのものは別文書を参照する。
 
 ---
 
