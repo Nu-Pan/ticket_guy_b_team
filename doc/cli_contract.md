@@ -12,6 +12,7 @@
 * MVP の制約
 
 本書は CLI 利用者および CLI 実装者向けの契約文書であり、詳細なファイル形式や状態遷移そのものは別文書を参照する。
+Codex の live / stub 切り替えの詳細は `codex_cli_wrapper.md` を参照する。
 
 ---
 
@@ -21,6 +22,7 @@
 * CLI は内部フレームワーク概念を隠蔽し、業務概念を提供する
 * 人間は Plan、Ticket、Review、Artifacts という概念で操作できるべきである
 * 内部のエージェント実行基盤やワークフローエンジンの詳細は CLI から直接露出しない
+* Codex 呼び出しは wrapper 経由でのみ行う
 * 失敗時も、原因と次に取るべき行動が短く理解できる出力を返す
 
 ---
@@ -73,6 +75,7 @@ CLI は最低限以下のコマンドを提供する。
   * 検証失敗
   * 実行失敗
   * 入力不正
+  * stub record 指定不備
 
 ---
 
@@ -87,9 +90,9 @@ CLI は最低限以下のコマンドを提供する。
 例:
 
 ```text
-ERROR: plan is not approved
-Impact: ticket generation was not started
-Next: run `tgbt approve <plan_id>` after fixing missing sections
+ERROR: --stub-record is required in stub mode
+Impact: worker execution was not started
+Next: rerun with --codex-cli-mode stub --stub-record <path>
 ```
 
 ---
@@ -98,6 +101,7 @@ Next: run `tgbt approve <plan_id>` after fixing missing sections
 
 * 成功時も失敗時も、可能な限り状態更新とログ保存を行う
 * 実行時に起きた事実はログへ保存する
+* worker 実行では codex session record を保存する
 * ログ保存自体に失敗した場合も、その失敗を標準エラー等へ可能な限り残す
 
 ---
@@ -107,6 +111,23 @@ Next: run `tgbt approve <plan_id>` after fixing missing sections
 * 人間向けの簡潔な標準出力を返す
 * 機械処理向けには JSON 出力を将来拡張してよい
 * MVP では人間可読性を優先するが、ログと成果物パスが追跡できることを維持する
+* worker 実行では `codex_cli_mode` と session record path を返すことが望ましい
+
+---
+
+## 5.5 モード用語
+
+本仕様で扱う実行モードは `codex_cli_mode` のみである。
+
+### `codex_cli_mode`
+
+worker ticket 内部で Codex をどう扱うかを表す。
+
+* `live`
+* `stub`
+
+`run` は常に実行コマンドであり、dry-run / preflight / validate は現時点では提供しない。
+必要になった場合は将来サブコマンドとして追加する。
 
 ---
 
@@ -300,6 +321,7 @@ Generated tickets:
 * すべてのチケットに一意な `ticket_id` を付与する
 * すべてのチケットに `Dependencies` を含める
 * すべてのチケットに `Acceptance Criteria` を含める
+* worker ticket は `default_codex_cli_mode` を持ってよい
 * review ticket の依存先は対応 worker ticket の `review_pending`
 * integration ticket の依存先は対象 review ticket の `done`
 
@@ -332,19 +354,37 @@ root ticket または個別 `ticket_id` を指定して実行する。
 ## 9.2 入力
 
 * `ticket_id`
-* `mode`
-* 必要に応じて `model`, `reasoning_effort`
+* 必要に応じて `--codex-cli-mode`
+* 必要に応じて `--model`, `--reasoning-effort`
+* 必要に応じて `--stub-record`
 
 現在の想定形:
 
 ```bash
-tgbt run <ticket_id> [mode] [model] [reasoning_effort]
+tgbt run <ticket_id> [--codex-cli-mode <live|stub>] [--stub-record <path>] [--model <model>] [--reasoning-effort <effort>]
 ```
 
-`mode` は以下を受け付ける。
+ルール:
 
-* `dry-run`
-* `production`
+* `--codex-cli-mode` の既定値は `live`
+* `--codex-cli-mode` は worker ticket 実行時に意味を持つ
+* MVP では root ticket を起点にした `--codex-cli-mode stub` 実行はサポートしない
+* `--stub-record` は `--codex-cli-mode stub` のとき必須である
+* `--codex-cli-mode live` では `--stub-record` を指定してはならない
+
+例:
+
+```bash
+tgbt run worker-001 --codex-cli-mode live
+```
+
+```bash
+tgbt run worker-001 --codex-cli-mode stub --stub-record artifacts/codex/worker-001-run-0001-call-0001.json
+```
+
+```bash
+tgbt run root-001 --codex-cli-mode live
+```
 
 ---
 
@@ -356,14 +396,23 @@ tgbt run <ticket_id> [mode] [model] [reasoning_effort]
 * ログ保存先
 * 生成・更新された成果物パス
 
+worker 実行では、さらに以下を返すことが望ましい。
+
+* `codex_cli_mode`
+* `codex_session_record_path`
+* `replayed_from` または `none`
+
 例:
 
 ```text
 Ticket: worker-001
 Status: review_pending
-Log: artifacts/logs/worker-001-run-0001.jsonl
+CodexCliMode: stub
+Log: artifacts/logs/worker-001-run-0002.jsonl
+CodexSession: artifacts/codex/worker-001-run-0002-call-0001.json
+ReplayedFrom: artifacts/codex/worker-001-run-0001-call-0001.json
 Artifacts:
-- artifacts/messages/worker-001-run-0001.txt
+- artifacts/messages/worker-001-run-0002.txt
 ```
 
 ---
@@ -373,42 +422,43 @@ Artifacts:
 * root ticket 指定時は、依存関係に従って実行可能なチケットだけを開始する
 * 依存未解決のチケットは開始してはならない
 * `blocked` または `failed` が発生した場合は、影響範囲が分かる出力を返すことが望ましい
-* 少なくとも開始、依存判定、外部実行、受け入れゲート、状態更新、終了をログへ記録する
+* 少なくとも開始、依存判定、wrapper 実行、受け入れゲート、状態更新、終了をログへ記録する
+* worker 実行では Codex CLI wrapper を必ず経由する
 
 ---
 
-## 9.5 `dry-run`
+## 9.5 `codex_cli_mode`
 
-* 外部実行を行わない
-* 最小限の状態遷移と成果物生成確認のみを行う
-* 開始可否の検証、依存関係評価、ファイル書き込み確認を主目的とする
-
----
-
-## 9.6 `production`
-
-* worker ticket では `codex exec` を呼び出す
+* worker ticket では Codex CLI wrapper を呼び出す
+* `--codex-cli-mode live` では wrapper が `codex exec` を実行する
+* `--codex-cli-mode stub` では wrapper が `--stub-record` で明示指定された record を再生する
 * review / integration ticket では自動受け入れゲートを実行する
 * 実行内容は常時ログへ保存する
 
 ---
 
-## 9.7 失敗条件
+## 9.6 失敗条件
 
 * Ticket file が存在しない
 * 対象 Plan が未承認である
 * 依存条件が未解決である
 * 外部実行に失敗した
 * 自動受け入れゲートが fail した
+* `--stub-record` が未指定である
+* 指定された stub record が見つからない
+* 指定された stub record の schema または内容が不正である
+* root ticket に対して `--codex-cli-mode stub` を指定した
 * 状態更新またはログ保存に失敗した
 
 ---
 
-## 9.8 MVP 制約
+## 9.7 MVP 制約
 
 * root ticket 実行時も並列実行は行わず逐次実行に留める
 * 影響範囲分析や継続判断支援の詳細表示は未実装でもよい
 * まずは JSON または簡潔テキストで結果を返せればよい
+* stub replay source は `--stub-record` による明示 path 指定のみをサポートすればよい
+* root ticket を起点にした stub 実行は未対応でよい
 
 ---
 
@@ -491,6 +541,7 @@ tgbt artifacts --ticket-id worker-001
 * 生成・更新された成果物
 * review result file
 * 実行ログ
+* codex session record file
 * last message file
 
 存在しない成果物は存在しないことを明示する。
@@ -501,6 +552,7 @@ tgbt artifacts --ticket-id worker-001
 Artifacts for worker-001:
 - artifacts/tickets/worker-001.md
 - artifacts/logs/worker-001-run-0001.jsonl
+- artifacts/codex/worker-001-run-0001-call-0001.json
 - artifacts/messages/worker-001-run-0001.txt
 - artifacts/reviews/review-001.md
 Missing:
@@ -532,7 +584,9 @@ CLI 実装は以下を前提とする。
 ## 13. バックエンド依存事項
 
 * ワークフロー制御には `LangGraph` を用いる
-* 本番 worker 実行には `codex exec` を用いる
+* worker 実行は `CodexCliWrapper` 経由で行う
+* live モードでは `codex exec` を用いる
+* stub モードでは record replay を用いる
 * 本番 smoke test は opt-in とする
 * トークン消費抑制のため、既定候補モデルとして `gpt-5.1-codex-mini` を用いてよい
 
@@ -546,6 +600,8 @@ CLI 実装は以下を前提とする。
 * 完了条件が曖昧な Ticket を実行してはならない
 * 自動受け入れゲートなしで大量実行してはならない
 * 下流工程を人間の全件レビュー前提で設計してはならない
+* CLI から `codex exec` を直接叩いてはならない
+* stub モードで live 相当の副作用が発生したように偽装してはならない
 
 ---
 
@@ -559,6 +615,7 @@ CLI 実装は以下を前提とする。
 * review / integration の受け入れゲートは `pytest -q` 優先、`tests/` 不在時は軽量判定でよい
 * `pyright` 自動実行は未実装でもよい
 * 影響範囲分析や継続判断支援は簡易出力でもよい
+* stub では `--stub-record` による明示 replay のみをサポートすればよい
 
 ---
 
@@ -569,3 +626,4 @@ CLI 実装は以下を前提とする。
 * review queue の高度フィルタ
 * 複数リポジトリ対応
 * Web UI との併用
+* record から fixture への昇格コマンド

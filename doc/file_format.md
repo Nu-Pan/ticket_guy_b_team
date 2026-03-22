@@ -9,6 +9,7 @@
 * Ticket file
 * Review result file
 * Execution log file
+* Codex session record file
 * Last message file
 
 本書はファイル形式と保存規約に集中し、CLI 契約や詳細な状態遷移は扱わない。
@@ -19,9 +20,10 @@
 
 * 主要オブジェクトはファイルとして永続化する
 * 主要ファイルは人間可読な形式を優先する
-* 機械処理対象のログは JSON Lines を用いる
+* 機械処理対象のログは JSON Lines または JSON を用いる
 * 生成物は一貫した命名規則とディレクトリ構造に従う
 * 実行失敗時も可能な限りファイルを保存する
+* live 実行の記録は stub 実行にそのまま転用可能でなければならない
 
 ---
 
@@ -35,6 +37,7 @@ artifacts/
   tickets/
   reviews/
   logs/
+  codex/
   messages/
 ```
 
@@ -44,7 +47,8 @@ artifacts/
 * `artifacts/tickets/`: チケットファイル
 * `artifacts/reviews/`: review / integration の結果ファイル
 * `artifacts/logs/`: 実行ログ JSONL
-* `artifacts/messages/`: `codex exec --output-last-message` のテキスト出力
+* `artifacts/codex/`: Codex CLI wrapper の session record
+* `artifacts/messages/`: `codex exec --output-last-message` または replay された最終メッセージのテキスト出力
 
 ---
 
@@ -70,6 +74,7 @@ artifacts/
 * `plan_id` は一意でなければならない
 * `ticket_id` は一意でなければならない
 * `run_id` は `run` 実行ごとに新規採番しなければならない
+* `codex_call_id` は 1 回の wrapper 呼び出しごとに一意でなければならない
 
 ### 4.5 YAML front matter
 
@@ -224,6 +229,7 @@ Ticket file の YAML front matter は最低限以下を含む。
 * `target_ticket_id`
 * `artifacts`
 * `run_history`
+* `default_codex_cli_mode`
 
 ただし、依存関係の正規表現は本文の `Dependencies` セクションまたは明示的な YAML 項目のどちらか一方に統一することが望ましい。
 
@@ -270,7 +276,20 @@ Dependencies では、各依存を `ticket_id` と `required_state` の組で表
 
 ---
 
-## 6.6 例
+## 6.6 Artifacts Path の推奨記載
+
+worker ticket では、少なくとも以下を Artifacts Path に記載できることが望ましい。
+
+```md
+# Artifacts Path
+- artifacts/logs/worker-001-<run_id>.jsonl
+- artifacts/codex/worker-001-<run_id>-<codex_call_id>.json
+- artifacts/messages/worker-001-<run_id>.txt
+```
+
+---
+
+## 6.7 例
 
 ```md
 ---
@@ -280,6 +299,7 @@ status: todo
 plan_id: plan-20260321-001
 owner_role: implementer
 priority: high
+default_codex_cli_mode: live
 ---
 
 # Title
@@ -330,6 +350,8 @@ implementer
 
 # Artifacts Path
 - artifacts/logs/worker-001-<run_id>.jsonl
+- artifacts/codex/worker-001-<run_id>-<codex_call_id>.json
+- artifacts/messages/worker-001-<run_id>.txt
 ```
 
 ---
@@ -424,6 +446,12 @@ artifacts/logs/<ticket_id>-<run_id>.jsonl
 * `event`
 * `ticket_id`
 
+worker 実行では、さらに以下を記録できることが望ましい。
+
+* `codex_cli_mode`
+* `codex_session_record_path`
+* `replayed_from`
+
 ---
 
 ## 8.4 代表的な追加フィールド
@@ -433,7 +461,6 @@ artifacts/logs/<ticket_id>-<run_id>.jsonl
 * `plan_id`
 * `ticket_type`
 * `run_id`
-* `mode`
 * `before_status`
 * `after_status`
 * `command`
@@ -454,6 +481,8 @@ artifacts/logs/<ticket_id>-<run_id>.jsonl
 * `run_started`
 * `dependency_checked`
 * `status_changed`
+* `codex_wrapper_started`
+* `codex_wrapper_finished`
 * `external_command_started`
 * `external_command_finished`
 * `acceptance_gate_started`
@@ -463,24 +492,155 @@ artifacts/logs/<ticket_id>-<run_id>.jsonl
 * `run_failed`
 * `blocked`
 
+`codex_wrapper_started` / `codex_wrapper_finished` は wrapper レベルの抽象イベントであり、live / stub の差異をここで吸収する。
+
 ---
 
 ## 8.6 例
 
 ```json
-{"timestamp":"2026-03-21T13:30:00+09:00","event":"run_started","ticket_id":"worker-001","plan_id":"plan-20260321-001","ticket_type":"worker","run_id":"run-0001","mode":"production"}
+{"timestamp":"2026-03-21T13:30:00+09:00","event":"run_started","ticket_id":"worker-001","plan_id":"plan-20260321-001","ticket_type":"worker","run_id":"run-0001","codex_cli_mode":"live"}
 {"timestamp":"2026-03-21T13:30:01+09:00","event":"dependency_checked","ticket_id":"worker-001","dependency_check":{"result":"ok"}}
 {"timestamp":"2026-03-21T13:30:02+09:00","event":"status_changed","ticket_id":"worker-001","before_status":"todo","after_status":"running"}
-{"timestamp":"2026-03-21T13:30:05+09:00","event":"external_command_finished","ticket_id":"worker-001","command":"codex exec ...","returncode":0,"stdout":"...","stderr":""}
+{"timestamp":"2026-03-21T13:30:03+09:00","event":"codex_wrapper_started","ticket_id":"worker-001","codex_cli_mode":"live","codex_call_id":"call-0001"}
+{"timestamp":"2026-03-21T13:30:05+09:00","event":"codex_wrapper_finished","ticket_id":"worker-001","codex_cli_mode":"live","codex_session_record_path":"artifacts/codex/worker-001-run-0001-call-0001.json","returncode":0}
 {"timestamp":"2026-03-21T13:30:06+09:00","event":"status_changed","ticket_id":"worker-001","before_status":"running","after_status":"review_pending"}
 {"timestamp":"2026-03-21T13:30:07+09:00","event":"run_finished","ticket_id":"worker-001","run_id":"run-0001"}
 ```
 
 ---
 
-## 9. Last Message File Format
+## 9. Codex Session Record File Format
 
 ## 9.1 保存先
+
+```text
+artifacts/codex/<ticket_id>-<run_id>-<codex_call_id>.json
+```
+
+同一 `run_id` で複数回 wrapper を呼ぶ場合に備え、`codex_call_id` を含める。
+
+---
+
+## 9.2 用途
+
+* live 実行の request / response を記録する
+* stub 実行では caller から明示指定された再生元としてそのまま利用する
+* stub 実行時にも、現在 run 用の session record を新規生成してよい
+* 実行監査と回帰テストの両方に使えるようにする
+
+---
+
+## 9.3 必須フィールド
+
+少なくとも以下を含める。
+
+* `schema_version`
+* `ticket_id`
+* `plan_id`
+* `run_id`
+* `codex_call_id`
+* `created_at`
+* `codex_cli_mode`
+* `request`
+* `result`
+
+live 実行で作られた record では、さらに以下を含めることが望ましい。
+
+* `replayable`
+* `recorded_from: "live"`
+
+stub 実行で作られた record では、さらに以下を含めることが望ましい。
+
+* `replayed_from`
+* `recorded_from: "stub"`
+
+---
+
+## 9.4 `request` オブジェクトの推奨フィールド
+
+* `argv`
+* `cwd`
+* `prompt_text`
+* `input_files`
+* `model`
+* `reasoning_effort`
+* `timeout_sec`
+
+秘密情報を含みうる環境変数を丸ごと保存してはならない。
+必要な場合は allowlist 化した `env` のみ保存してよい。
+
+---
+
+## 9.5 `result` オブジェクトの推奨フィールド
+
+* `returncode`
+* `stdout`
+* `stderr`
+* `last_message_text`
+* `last_message_path`
+* `stop_reason`
+* `generated_artifacts`
+
+stub で再生に使うには、少なくとも `returncode`, `stdout`, `stderr`, `last_message_text` が欠落していてはならない。
+
+---
+
+## 9.6 例
+
+```json
+{
+  "schema_version": "1",
+  "ticket_id": "worker-001",
+  "plan_id": "plan-20260321-001",
+  "run_id": "run-0001",
+  "codex_call_id": "call-0001",
+  "created_at": "2026-03-21T13:30:05+09:00",
+  "codex_cli_mode": "live",
+  "recorded_from": "live",
+  "replayable": true,
+  "request": {
+    "argv": ["codex", "exec", "--output-last-message", "artifacts/messages/worker-001-run-0001.txt"],
+    "cwd": "/repo",
+    "prompt_text": "worker-001 を実行せよ",
+    "model": "gpt-5.1-codex-mini",
+    "reasoning_effort": "medium",
+    "timeout_sec": 1800
+  },
+  "result": {
+    "returncode": 0,
+    "stdout": "updated 3 files",
+    "stderr": "",
+    "last_message_text": "実装が完了しました。",
+    "last_message_path": "artifacts/messages/worker-001-run-0001.txt",
+    "stop_reason": "completed",
+    "generated_artifacts": [
+      "src/cli.py",
+      "tests/test_cli.py"
+    ]
+  }
+}
+```
+
+---
+
+## 9.7 stub 転用ルール
+
+live で生成した record は、形式変換なしで stub の入力に使えることを要求する。
+stub 側は caller から明示指定された path の record だけを読み、探索や自動推定は行わない。
+ただし stub 実行側で以下を追加してもよい。
+
+* 現在の run 用 `last_message_path` への再配置
+* `replayed_from` の付与
+* 現在 run 用 session record の再保存
+
+元 record 自体を書き換えることは推奨しない。
+
+---
+
+## 10. Last Message File Format
+
+## 10.1 保存先
 
 ```text
 artifacts/messages/<ticket_id>-<run_id>.txt
@@ -488,15 +648,16 @@ artifacts/messages/<ticket_id>-<run_id>.txt
 
 ---
 
-## 9.2 用途
+## 10.2 用途
 
 * `codex exec --output-last-message` の出力を保存する
+* stub 実行時は replay した `last_message_text` を保存してよい
 * JSONL ログとは混在させない
 * 人間確認や後続レビューで参照可能にする
 
 ---
 
-## 9.3 形式
+## 10.3 形式
 
 * プレーンテキストとする
 * JSONL に埋め込まない
@@ -504,9 +665,9 @@ artifacts/messages/<ticket_id>-<run_id>.txt
 
 ---
 
-## 10. 読み書き時のバリデーション方針
+## 11. 読み書き時のバリデーション方針
 
-## 10.1 Plan file
+## 11.1 Plan file
 
 最低限以下を確認する。
 
@@ -516,7 +677,7 @@ artifacts/messages/<ticket_id>-<run_id>.txt
 * `status` が許可値であること
 * 必須セクション見出しが存在すること
 
-## 10.2 Ticket file
+## 11.2 Ticket file
 
 最低限以下を確認する。
 
@@ -528,33 +689,46 @@ artifacts/messages/<ticket_id>-<run_id>.txt
 * `Dependencies` が読めること
 * `Acceptance Criteria` が存在すること
 
-## 10.3 Review result file
+## 11.3 Review result file
 
 最低限以下を確認する。
 
 * 対象 `ticket_id` が分かること
 * 判定結果または判定不能理由が分かること
 
-## 10.4 Log file
+## 11.4 Log file
 
 最低限以下を確認する。
 
 * 各行が JSON として読めること
 * `timestamp`, `event`, `ticket_id` が存在すること
 
+## 11.5 Codex session record file
+
+最低限以下を確認する。
+
+* JSON として読めること
+* `schema_version` があること
+* `ticket_id`, `run_id`, `codex_call_id` があること
+* `codex_cli_mode` が `live` または `stub` であること
+* `request` と `result` があること
+* stub 転用時に必要な result フィールドがあること
+
 ---
 
-## 11. 禁止事項
+## 12. 禁止事項
 
 * JSONL ログと最終メッセージを同一ファイルへ混在させてはならない
 * `ticket_id` や `plan_id` の重複を許してはならない
 * 必須メタデータ欠落のまま保存完了扱いにしてはならない
 * 実行失敗時にログ保存を省略してはならない
 * 判定不能時に理由を残さず review 結果を確定してはならない
+* replay 不可能な live record を黙って stub 用とみなしてはならない
+* 秘密情報を無加工で session record に保存してはならない
 
 ---
 
-## 12. MVP 制約
+## 13. MVP 制約
 
 現時点の最小実装では以下を許容する。
 
@@ -562,13 +736,16 @@ artifacts/messages/<ticket_id>-<run_id>.txt
 * Review result file の詳細スキーマはまだ緩くてよい
 * `generated_artifacts` など一部フィールドは省略可能
 * `stdout`, `stderr` は巨大な場合に切り詰めてもよいが、その事実を明示すること
+* `request` の diff 判定は未実装でもよい
+* stub replay source は明示 path 指定のみをサポートすればよい
 
 ---
 
-## 13. 将来拡張
+## 14. 将来拡張
 
 * YAML front matter の厳密 JSON Schema 化
 * Ticket / Review result の専用シリアライズ形式導入
 * 添付成果物メタデータファイルの追加
 * 実行ログのローテーションや圧縮
 * 監査向けイベント種別の拡張
+* session record の匿名化・正規化パイプライン

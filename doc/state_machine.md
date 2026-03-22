@@ -8,7 +8,7 @@
 * Plan の状態遷移
 * Ticket の状態遷移
 
-本書は状態遷移の定義に集中し、CLI 契約、ファイル形式、製品背景説明は扱わない。
+本書は状態遷移の定義に集中し、CLI 契約、ファイル形式、製品背景説明、Codex CLI wrapper の詳細実装は扱わない。
 
 ---
 
@@ -19,6 +19,8 @@
 * 未承認計画や未解決依存のまま実行を開始してはならない
 * 状態遷移の結果は常に永続化され、ログで追跡可能でなければならない
 * 失敗時も途中状態と停止理由を可能な限り保存しなければならない
+* live / stub の違いで業務上の状態意味を変えてはならない
+* wrapper のモード差異は、開始条件・副作用・記録条件で吸収しなければならない
 
 ---
 
@@ -179,6 +181,7 @@ Ticket は以下の状態を持つ。
 
 * 実行主体が現在このチケットの処理を進めている
 * 実行ログを継続的に残す対象状態である
+* live / stub のいずれであっても、開始後は同じ `running` として扱う
 
 ### `review_pending`
 
@@ -201,6 +204,7 @@ Ticket は以下の状態を持つ。
 * 外部実行失敗
 * 中断
 * review fail
+* stub replay の整合性崩壊
 
 などを表す。
 
@@ -213,6 +217,10 @@ Ticket は以下の状態を持つ。
 * `blocked` は停止理由付きの待機状態として扱う
 * 停止理由が解消された場合のみ `todo` または `running` に戻せる
 * 状態遷移時は前後状態と理由をログへ記録しなければならない
+* worker ticket の実行時は `codex_cli_mode` を記録しなければならない
+* `codex_cli_mode=stub` では、状態遷移開始前に replay source 指定を検証しなければならない
+* replay source 指定不足は `running` 遷移後の `blocked` ではなく、開始前の入力・設定エラーとして扱う
+* live / stub によって `done` 条件や `review_pending` 条件を変えてはならない
 
 ---
 
@@ -233,9 +241,24 @@ Ticket は以下の状態を持つ。
 
 ---
 
-## 6. Ticket Type 別状態規則
+## 6. 実行コンテキスト
 
-## 6.1 root ticket
+状態遷移に影響する実行コンテキストとして、worker ticket では少なくとも以下を区別する。
+
+* `codex_cli_mode`
+  * `live`
+  * `stub`
+
+`codex_cli_mode` は worker 内部の Codex 呼び出し方法である。
+root / review / integration ticket では通常この区別を必要としない。
+なお `codex_cli_mode=stub` では replay source の明示指定が前提であり、自動解決は行わない。
+`run` は常に実行コマンドであり、事前検証専用の dry-run は持たない。
+
+---
+
+## 7. Ticket Type 別状態規則
+
+## 7.1 root ticket
 
 ### 役割
 
@@ -265,12 +288,13 @@ Ticket は以下の状態を持つ。
 
 ---
 
-## 6.2 worker ticket
+## 7.2 worker ticket
 
 ### 役割
 
 * 個別成果物の生成または変更
 * ローカル検証の実施
+* 必要に応じて Codex CLI wrapper を経由した実行
 
 ### 基本遷移
 
@@ -287,6 +311,7 @@ Ticket は以下の状態を持つ。
 
 * すべての依存条件が満たされていること
 * 参照入力が存在すること
+* `codex_cli_mode=stub` の場合、`stub_record_path` が明示指定され、読み取り可能かつ schema 互換であること
 
 ### `running -> review_pending`
 
@@ -295,6 +320,7 @@ Ticket は以下の状態を持つ。
 * 実装が完了していること
 * ローカル検証が完了していること
 * Outputs が保存されていること
+* live / stub のどちらでも共通 result モデル上で成功扱いに正規化されていること
 
 ### `running -> blocked`
 
@@ -312,6 +338,8 @@ Ticket は以下の状態を持つ。
 * 外部実行失敗
 * 受け入れ前提のローカル検証失敗
 * 中断
+* stub replay 結果が必須成果物を再構成できない
+* record schema mismatch
 
 ### `review_pending -> done`
 
@@ -334,7 +362,7 @@ Ticket は以下の状態を持つ。
 
 ---
 
-## 6.3 review ticket
+## 7.3 review ticket
 
 ### 役割
 
@@ -393,7 +421,7 @@ Ticket は以下の状態を持つ。
 
 ---
 
-## 6.4 integration ticket
+## 7.4 integration ticket
 
 ### 役割
 
@@ -440,7 +468,7 @@ Ticket は以下の状態を持つ。
 
 ---
 
-## 7. 状態遷移時の必須記録
+## 8. 状態遷移時の必須記録
 
 すべての状態遷移について、少なくとも以下をログに残す。
 
@@ -450,6 +478,12 @@ Ticket は以下の状態を持つ。
 * `before_status`
 * `after_status`
 * `reason`
+
+worker ticket の実行では、さらに以下を残す。
+
+* `codex_cli_mode`
+* `codex_session_record_path`
+* `replayed_from` または `null`
 
 必要に応じて以下も残す。
 
@@ -461,16 +495,18 @@ Ticket は以下の状態を持つ。
 
 ---
 
-## 8. 判定原則
+## 9. 判定原則
 
 * 実行可否は現在状態と依存状態から機械的に判定する
 * review の pass / fail はレビュー結果ファイルにより確定する
 * integration の pass / fail は統合レビュー結果ファイルにより確定する
 * 判定不能時は黙って進めず `blocked` に遷移する
+* stub は process spawn を省略しても、判定の入力と出力は live と同等に扱う
+* replay source 指定不足は状態遷移内で吸収せず、実行開始前の検証で弾く
 
 ---
 
-## 9. 禁止事項
+## 10. 禁止事項
 
 * `approved` でない Plan を起点に Ticket 実行を開始してはならない
 * 依存未解決の Ticket を `running` にしてはならない
@@ -478,23 +514,26 @@ Ticket は以下の状態を持つ。
 * review 結果未確定のまま integration を開始してはならない
 * 停止理由を記録せずに `blocked` にしてはならない
 * ログを残さずに状態遷移してはならない
+* live / stub によって business state の意味を変えてはならない
 
 ---
 
-## 10. MVP 制約
+## 11. MVP 制約
 
 現時点の最小実装では以下を許容する。
 
 * root ticket 実行は一般化スケジューラではなく逐次評価でよい
 * integration ticket は単一 review ticket を対象とする定型構成でもよい
 * `blocked` 理由の構造化は粗くてもよいが、少なくとも人間が読める説明を残すこと
+* stub replay source は明示 path 指定のみをサポートすればよい
 
 ---
 
-## 11. 将来拡張
+## 12. 将来拡張
 
 * 再実行専用状態の導入
 * cancel / aborted の区別
 * partial_success の導入
 * 並列スケジューリング対応状態の追加
 * 人間レビュータスク専用状態の追加
+* stub fixture の承認状態管理

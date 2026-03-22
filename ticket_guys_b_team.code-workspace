@@ -8,7 +8,8 @@
 		"files.exclude": {
 			"**/__pycache__": true,
 			"**/*.egg-info": true,
-			".pytest_cache": true
+			"**/.pytest_cache": true,
+			"**/*.Identifier": true,
 		}
 	},
 	"extensions": {
